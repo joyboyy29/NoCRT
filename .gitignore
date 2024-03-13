@@ -1,4 +1,6 @@
-*
-!README.md
-!LICENSE
-!NoCRT/NoCRT.hpp
+/*
+!/README.md
+!/LICENSE
+!/NoCRT/
+/NoCRT/*
+!/NoCRT/NoCRT.hpp
