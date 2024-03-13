@@ -1,2 +1,3 @@
 # NoCRT
- A lightweight single header library that provides some CRT functionality using modern C++
+- Implementing basic CRT functionality using modern C++.
+- C++ 17 and above
