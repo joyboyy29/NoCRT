@@ -1,4 +1,4 @@
-!.gitignore
+*
 !README.md
 !LICENSE
-!*.hpp
+!NoCRT/NoCRT.hpp
