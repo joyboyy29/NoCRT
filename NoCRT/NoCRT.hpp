@@ -1,6 +1,29 @@
 #pragma once
 
+#include <intrin.h>
+
 namespace NoCRT {
+
+    class SpinLock {
+    private:
+        volatile long _lock;
+
+    public:
+        SpinLock() : _lock(0) {}
+
+        void lock() {
+            int backoff = 1;
+            while (_InterlockedCompareExchange(&_lock, 1, 0) != 0) {
+                while (_lock == 1) {
+                    _mm_pause();
+                }
+            }
+        }
+
+        void unlock() {
+            _InterlockedExchange(&_lock, 0);
+        }
+    };
 
     template <typename T, size_t N>
     class NoArray {
