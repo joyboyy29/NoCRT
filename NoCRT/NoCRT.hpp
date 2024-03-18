@@ -2,26 +2,59 @@
 
 #include <intrin.h>
 
+typedef unsigned char uint8_t;
+
 namespace NoCRT {
 
-    class SpinLock {
+    class BaseSpinLock {
     private:
         volatile long _lock;
 
     public:
-        SpinLock() : _lock(0) {}
+        BaseSpinLock() : _lock(0) {}
 
         void lock() {
-            int backoff = 1;
             while (_InterlockedCompareExchange(&_lock, 1, 0) != 0) {
-                while (_lock == 1) {
-                    _mm_pause();
-                }
+                _mm_pause();
             }
         }
 
         void unlock() {
             _InterlockedExchange(&_lock, 0);
+        }
+    };
+
+    class RLock {
+    private:
+        BaseSpinLock _lock;
+        volatile const char* _ownerThreadId;
+        volatile long _depth;
+
+    public:
+        RLock() : _ownerThreadId(0), _depth(0) {}
+
+        void lock() {
+            const char* currentThreadId = reinterpret_cast<const char*>(__readgsqword(0x30)); // 0x30 -> TEB
+
+            if (_ownerThreadId == currentThreadId) {
+                _depth++;
+            }
+            else {
+                _lock.lock();
+                _ownerThreadId = currentThreadId;
+                _depth = 1;
+            }
+        }
+
+        void unlock() {
+            const char* currentThreadId = reinterpret_cast<const char*>(__readgsqword(0x30)); // 0x30 -> TEB
+
+            if (_ownerThreadId == currentThreadId) {
+                if (--_depth == 0) {
+                    _ownerThreadId = 0;
+                    _lock.unlock();
+                }
+            }
         }
     };
 
@@ -68,7 +101,7 @@ namespace NoCRT {
         };
 
         NoArray() : _data{} {}
-         
+
         Iterator begin() {
             return Iterator(_data);
         }
@@ -122,6 +155,218 @@ namespace NoCRT {
 
     template<typename T, size_t N>
     T NoArray<T, N>::_errorValue = T{};
+
+    class NoAlloc {
+    private:
+        struct BlockHeader {
+            size_t          size;
+            bool            allocated;
+            BlockHeader* next;
+        };
+
+        BlockHeader* _firstBlock;
+        RLock               _lock;
+        size_t              _totalHeapSize;
+        uint8_t* _heapBase;  // start
+        uint8_t* _heapLimit; // end + 1
+
+        void memcpy(void* dest, const void* src, size_t n) {
+            char* d = reinterpret_cast<char*>(dest);
+            const char* s = reinterpret_cast<const char*>(src);
+            while (n--) {
+                *d++ = *s++;
+            }
+        }
+
+        void memset(void* ptr, int val, size_t n) {
+            unsigned char* p = reinterpret_cast<unsigned char*>(ptr);
+            while (n-- > 0) {
+                *p++ = static_cast<unsigned char>(val);
+            }
+        }
+
+        void memmove(void* dest, const void* src, size_t n) {
+            char* d = reinterpret_cast<char*>(dest);
+            const char* s = reinterpret_cast<const char*>(src);
+
+            if (d < s) {
+                while (n--) {
+                    *d++ = *s++;
+                }
+            }
+            else {
+                d += n;
+                s += n;
+                while (n--) {
+                    *--d = *--s;
+                }
+            }
+        }
+
+        int memcmp(const void* s1, const void* s2, size_t n) {
+            const unsigned char* p1 = reinterpret_cast<const unsigned char*>(s1);
+            const unsigned char* p2 = reinterpret_cast<const unsigned char*>(s2);
+            while (n-- > 0) {
+                if (*p1 != *p2) {
+                    return *p1 - *p2;
+                }
+                p1++;
+                p2++;
+            }
+            return 0;
+        }
+
+
+        void calcStats(size_t& totalAllocated, size_t& totalFree, size_t& largestFreeBlock, size_t& freeBlocksCount) const {
+            totalAllocated = 0;
+            totalFree = 0;
+            largestFreeBlock = 0;
+            freeBlocksCount = 0;
+
+            BlockHeader* current = _firstBlock;
+            while (current != nullptr) {
+                if (current->allocated) {
+                    totalAllocated += current->size;
+                }
+                else {
+                    totalFree += current->size;
+                    ++freeBlocksCount;
+                    if (current->size > largestFreeBlock) {
+                        largestFreeBlock = current->size;
+                    }
+                }
+                current = current->next;
+            }
+        }
+
+        bool isValidHeapPtr(void* ptr) const {
+            return ptr >= _heapBase && ptr < _heapLimit;
+        }
+
+    public:
+        NoAlloc(size_t heapSize) : _totalHeapSize(heapSize) {
+            static uint8_t heap[1024 * 1024];
+            _heapBase = heap;
+            _heapLimit = heap + sizeof(heap);
+            _firstBlock = reinterpret_cast<BlockHeader*>(heap);
+            _firstBlock->size = heapSize - sizeof(BlockHeader);
+            _firstBlock->allocated = false;
+            _firstBlock->next = nullptr;
+        }
+
+        // maybe using buddy system for better performance?
+        void* malloc(size_t size) {
+            _lock.lock();
+            BlockHeader* current = _firstBlock;
+            while (current != nullptr) {
+                if (!current->allocated && current->size >= size + sizeof(BlockHeader)) {
+                    size_t remainingSize = current->size - size - sizeof(BlockHeader);
+
+                    current->allocated = true;
+                    current->size = size;
+
+                    if (remainingSize > sizeof(BlockHeader)) {
+                        BlockHeader* newBlock = reinterpret_cast<BlockHeader*>(reinterpret_cast<char*>(current + 1) + size);
+                        newBlock->size = remainingSize;
+                        newBlock->allocated = false;
+                        newBlock->next = current->next;
+                        current->next = newBlock;
+                    }
+                    _lock.unlock();
+
+                    merge();
+                    return reinterpret_cast<void*>(current + 1);
+                }
+                current = current->next;
+            }
+            _lock.unlock();
+            return nullptr;
+        }
+
+        void free(void* ptr) {
+            if (ptr == nullptr) {
+                return;
+            }
+
+            _lock.lock();
+
+            // free ptr out of bounds
+            if (!isValidHeapPtr(ptr)) {
+                _lock.unlock();
+                return;
+            }
+
+            // free already freed ptr
+            BlockHeader* header = reinterpret_cast<BlockHeader*>(ptr) - 1;
+            if (!header->allocated) {
+                _lock.unlock();
+                return;
+            }
+
+            header->allocated = false;
+
+            merge();
+
+            _lock.unlock();
+        }
+
+        void* realloc(void* ptr, size_t newSize) {
+            if (ptr == nullptr) {
+                return malloc(newSize);
+            }
+
+            BlockHeader* header = reinterpret_cast<BlockHeader*>(ptr) - 1;
+            if (header->size >= newSize) {
+                return ptr;
+            }
+
+            void* newPtr = malloc(newSize);
+            if (newPtr != nullptr) {
+                memcpy(newPtr, ptr, header->size);
+                free(ptr);
+            }
+            return newPtr;
+        }
+
+        void* calloc(size_t numElements, size_t elementSize) {
+            _lock.lock();
+            size_t totalSize = numElements * elementSize;
+            void* ptr = malloc(totalSize);
+            if (ptr != nullptr) {
+                memset(ptr, 0, totalSize);
+            }
+            _lock.unlock();
+            return ptr;
+        }
+
+        void merge() {
+            BlockHeader* current = _firstBlock;
+            while (current != nullptr && current->next != nullptr) {
+                if (!current->allocated && !current->next->allocated) {
+                    current->size += current->next->size + sizeof(BlockHeader);
+                    current->next = current->next->next;
+                }
+                else {
+                    current = current->next;
+                }
+            }
+        }
+
+        void printStats() const {
+            size_t totalAllocated, totalFree, largestFreeBlock, freeBlocksCount;
+            calcStats(totalAllocated, totalFree, largestFreeBlock, freeBlocksCount);
+
+            // Test Purposes:
+
+            //std::cout << "Heap Allocator Statistics:\n";
+            //std::cout << "Total Heap Size: " << _totalHeapSize << " bytes\n";
+            //std::cout << "Total Allocated: " << totalAllocated << " bytes\n";
+            //std::cout << "Total Free: " << totalFree << " bytes\n";
+            //std::cout << "Number of Free Blocks: " << freeBlocksCount << "\n";
+            //std::cout << "Largest Free Block: " << largestFreeBlock << " bytes\n";
+        }
+
+    };
 
     template<typename T> struct remove_reference;
 
@@ -188,27 +433,27 @@ namespace NoCRT {
 
     // Boolean:
 
-    template<> struct is_integral_base<bool>                : true_type {};
+    template<> struct is_integral_base<bool> : true_type {};
 
     // Characters:
 
-    template<> struct is_integral_base<char>                : true_type {};
-    template<> struct is_integral_base<signed char>         : true_type {};
-    template<> struct is_integral_base<unsigned char>       : true_type {};
-    template<> struct is_integral_base<wchar_t>             : true_type {};
-    template<> struct is_integral_base<char16_t>            : true_type {};
-    template<> struct is_integral_base<char32_t>            : true_type {};
+    template<> struct is_integral_base<char> : true_type {};
+    template<> struct is_integral_base<signed char> : true_type {};
+    template<> struct is_integral_base<unsigned char> : true_type {};
+    template<> struct is_integral_base<wchar_t> : true_type {};
+    template<> struct is_integral_base<char16_t> : true_type {};
+    template<> struct is_integral_base<char32_t> : true_type {};
 
     // Integers:
 
-    template<> struct is_integral_base<short>               : true_type {};
-    template<> struct is_integral_base<unsigned short>      : true_type {};
-    template<> struct is_integral_base<int>                 : true_type {};
-    template<> struct is_integral_base<unsigned int>        : true_type {};
-    template<> struct is_integral_base<long>                : true_type {};
-    template<> struct is_integral_base<unsigned long>       : true_type {};
-    template<> struct is_integral_base<long long>           : true_type {};
-    template<> struct is_integral_base<unsigned long long>  : true_type {};
+    template<> struct is_integral_base<short> : true_type {};
+    template<> struct is_integral_base<unsigned short> : true_type {};
+    template<> struct is_integral_base<int> : true_type {};
+    template<> struct is_integral_base<unsigned int> : true_type {};
+    template<> struct is_integral_base<long> : true_type {};
+    template<> struct is_integral_base<unsigned long> : true_type {};
+    template<> struct is_integral_base<long long> : true_type {};
+    template<> struct is_integral_base<unsigned long long> : true_type {};
 
     // Custom one just in case for some other type
 
