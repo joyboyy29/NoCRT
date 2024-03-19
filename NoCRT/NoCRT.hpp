@@ -156,6 +156,7 @@ namespace NoCRT {
     template<typename T, size_t N>
     T NoArray<T, N>::_errorValue = T{};
 
+    template <size_t HeapSize = 1024 * 1024>
     class NoAlloc {
     private:
         struct BlockHeader {
@@ -163,6 +164,8 @@ namespace NoCRT {
             bool            allocated;
             BlockHeader* next;
         };
+
+        static uint8_t      _heap[HeapSize];
 
         BlockHeader* _firstBlock;
         RLock               _lock;
@@ -244,12 +247,9 @@ namespace NoCRT {
         }
 
     public:
-        NoAlloc(size_t heapSize) : _totalHeapSize(heapSize) {
-            static uint8_t heap[1024 * 1024];
-            _heapBase = heap;
-            _heapLimit = heap + sizeof(heap);
-            _firstBlock = reinterpret_cast<BlockHeader*>(heap);
-            _firstBlock->size = heapSize - sizeof(BlockHeader);
+        NoAlloc() : _totalHeapSize(HeapSize), _heapBase(_heap), _heapLimit(_heap + HeapSize) {
+            _firstBlock = reinterpret_cast<BlockHeader*>(_heapBase);
+            _firstBlock->size = HeapSize - sizeof(BlockHeader);
             _firstBlock->allocated = false;
             _firstBlock->next = nullptr;
         }
@@ -365,8 +365,10 @@ namespace NoCRT {
             //std::cout << "Number of Free Blocks: " << freeBlocksCount << "\n";
             //std::cout << "Largest Free Block: " << largestFreeBlock << " bytes\n";
         }
-
     };
+
+    template <size_t HeapSize>
+    uint8_t NoAlloc<HeapSize>::_heap[HeapSize];
 
     template<typename T> struct remove_reference;
 
