@@ -26,36 +26,43 @@ namespace NoCRT {
 
     class RLock {
     private:
-        BaseSpinLock _lock;
-        volatile const char* _ownerThreadId;
-        volatile long _depth;
+        BaseSpinLock        _lock;
+        volatile long long  _ownerThreadId;
+        volatile long       _depth;
+
+    private:
+        long long GetCurrentThreadId64() const {
+            return __readgsqword(0x30); // TEB + 0x30 = ThreadID on x64 Windows
+        }
 
     public:
         RLock() : _ownerThreadId(0), _depth(0) {}
 
         void lock() {
-            const char* currentThreadId = reinterpret_cast<const char*>(__readgsqword(0x30)); // 0x30 -> TEB
+            auto currentThreadId = GetCurrentThreadId64();
 
             if (_ownerThreadId == currentThreadId) {
                 _depth++;
             }
             else {
                 _lock.lock();
+                _ReadWriteBarrier(); // This is in order to prevent compiler reordering
                 _ownerThreadId = currentThreadId;
                 _depth = 1;
             }
         }
 
         void unlock() {
-            const char* currentThreadId = reinterpret_cast<const char*>(__readgsqword(0x30)); // 0x30 -> TEB
-
-            if (_ownerThreadId == currentThreadId) {
+            _ReadWriteBarrier();
+            if (_ownerThreadId == GetCurrentThreadId64()) {
                 if (--_depth == 0) {
                     _ownerThreadId = 0;
                     _lock.unlock();
                 }
             }
         }
+
+    
     };
 
     template <typename T, size_t N>
@@ -162,16 +169,16 @@ namespace NoCRT {
         struct BlockHeader {
             size_t          size;
             bool            allocated;
-            BlockHeader* next;
+            BlockHeader*    next;
         };
 
         static uint8_t      _heap[HeapSize];
 
-        BlockHeader* _firstBlock;
+        BlockHeader*        _firstBlock;
         RLock               _lock;
         size_t              _totalHeapSize;
-        uint8_t* _heapBase;  // start
-        uint8_t* _heapLimit; // end + 1
+        uint8_t*            _heapBase;  // start
+        uint8_t*            _heapLimit; // end + 1
 
         void memcpy(void* dest, const void* src, size_t n) {
             char* d = reinterpret_cast<char*>(dest);
@@ -180,6 +187,10 @@ namespace NoCRT {
                 *d++ = *s++;
             }
         }
+
+        //void memcpy(void* dest, const void* src, size_t n) {
+
+        //}
 
         void memset(void* ptr, int val, size_t n) {
             unsigned char* p = reinterpret_cast<unsigned char*>(ptr);
