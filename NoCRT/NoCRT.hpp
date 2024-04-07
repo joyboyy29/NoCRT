@@ -6,6 +6,19 @@ typedef unsigned char uint8_t;
 
 namespace NoCRT {
 
+    // Forward declarations
+
+    template<typename T>
+    void memcpy(T* dest, const T* src, size_t n);
+
+    void memset(void* ptr, int val, size_t n);
+
+    void memmove(void* dest, const void* src, size_t n);
+
+    int memcmp(const void* s1, const void* s2, size_t n);
+
+    //////////////////////////////////////////////////////////////////////////
+
     class BaseSpinLock {
     private:
         volatile long _lock;
@@ -61,8 +74,6 @@ namespace NoCRT {
                 }
             }
         }
-
-    
     };
 
     template <typename T, size_t N>
@@ -180,57 +191,6 @@ namespace NoCRT {
         uint8_t*            _heapBase;  // start
         uint8_t*            _heapLimit; // end + 1
 
-        void memcpy(void* dest, const void* src, size_t n) {
-            char* d = reinterpret_cast<char*>(dest);
-            const char* s = reinterpret_cast<const char*>(src);
-            while (n--) {
-                *d++ = *s++;
-            }
-        }
-
-        //void memcpy(void* dest, const void* src, size_t n) {
-
-        //}
-
-        void memset(void* ptr, int val, size_t n) {
-            unsigned char* p = reinterpret_cast<unsigned char*>(ptr);
-            while (n-- > 0) {
-                *p++ = static_cast<unsigned char>(val);
-            }
-        }
-
-        void memmove(void* dest, const void* src, size_t n) {
-            char* d = reinterpret_cast<char*>(dest);
-            const char* s = reinterpret_cast<const char*>(src);
-
-            if (d < s) {
-                while (n--) {
-                    *d++ = *s++;
-                }
-            }
-            else {
-                d += n;
-                s += n;
-                while (n--) {
-                    *--d = *--s;
-                }
-            }
-        }
-
-        int memcmp(const void* s1, const void* s2, size_t n) {
-            const unsigned char* p1 = reinterpret_cast<const unsigned char*>(s1);
-            const unsigned char* p2 = reinterpret_cast<const unsigned char*>(s2);
-            while (n-- > 0) {
-                if (*p1 != *p2) {
-                    return *p1 - *p2;
-                }
-                p1++;
-                p2++;
-            }
-            return 0;
-        }
-
-
         void calcStats(size_t& totalAllocated, size_t& totalFree, size_t& largestFreeBlock, size_t& freeBlocksCount) const {
             totalAllocated = 0;
             totalFree = 0;
@@ -333,7 +293,7 @@ namespace NoCRT {
 
             void* newPtr = malloc(newSize);
             if (newPtr != nullptr) {
-                memcpy(newPtr, ptr, header->size);
+                NoCRT::memcpy((uint8_t*)newPtr, (uint8_t*)ptr, header->size);
                 free(ptr);
             }
             return newPtr;
@@ -501,6 +461,40 @@ namespace NoCRT {
 
     template<bool cond, typename T = void> struct enable_if_t { typedef typename enable_if<cond, T>::type type; };
 
+    // is_trivially_copyable impl
+    // base template
+
+    template<typename T> struct is_trivially_copyable : false_type {};
+
+    // scalar types are trivially copyable
+    // specializations
+
+    template<> struct is_trivially_copyable<bool> : true_type {};
+    template<> struct is_trivially_copyable<char> : true_type {};
+    template<> struct is_trivially_copyable<signed char> : true_type {};
+    template<> struct is_trivially_copyable<unsigned char> : true_type {};
+    template<> struct is_trivially_copyable<wchar_t> : true_type {};
+    template<> struct is_trivially_copyable<char16_t> : true_type {};
+    template<> struct is_trivially_copyable<char32_t> : true_type {};
+    template<> struct is_trivially_copyable<short> : true_type {};
+    template<> struct is_trivially_copyable<unsigned short> : true_type {};
+    template<> struct is_trivially_copyable<int> : true_type {};
+    template<> struct is_trivially_copyable<unsigned int> : true_type {};
+    template<> struct is_trivially_copyable<long> : true_type {};
+    template<> struct is_trivially_copyable<unsigned long> : true_type {};
+    template<> struct is_trivially_copyable<long long> : true_type {};
+    template<> struct is_trivially_copyable<unsigned long long> : true_type {};
+    template<> struct is_trivially_copyable<float> : true_type {};
+    template<> struct is_trivially_copyable<double> : true_type {};
+    template<> struct is_trivially_copyable<long double> : true_type {};
+
+    // pointers are trivially copyable
+
+    template<typename T> struct is_trivially_copyable<T*> : true_type {};
+
+    template<typename T>
+    constexpr bool is_trivially_copyable_v = is_trivially_copyable<T>::value;
+
     // std::move and std::forward impl
 
     template<typename T>
@@ -511,5 +505,111 @@ namespace NoCRT {
     template<typename T>
     constexpr T&& forward(typename remove_reference<T>::type& arg) noexcept {
         return static_cast<T&&>(arg);
+    }
+
+    template<typename T>
+    void memcpy(T* dest, const T* src, size_t n = 1) {
+        static_assert(is_trivially_copyable<T>::value, "Type must be trivially copyable.");
+        __movsb(reinterpret_cast<unsigned char*>(dest),
+            reinterpret_cast<const unsigned char*>(src),
+            n * sizeof(T));
+    }
+
+    void memset(void* ptr, int val, size_t n) {
+        unsigned char* bytePtr = reinterpret_cast<unsigned char*>(ptr);
+
+        // 8 bits to 64 bits
+        uint64_t wideVal = 0x0101010101010101ULL * static_cast<unsigned char>(val);
+
+        //align
+        while (n > 0 && (reinterpret_cast<uintptr_t>(bytePtr) % 8) != 0) {
+            *bytePtr++ = static_cast<unsigned char>(val);
+            n--;
+        }
+
+        // 8 byte writing
+        uint64_t* widePtr = reinterpret_cast<uint64_t*>(bytePtr);
+        while (n >= 8) {
+            *widePtr++ = wideVal;
+            n -= 8;
+        }
+
+        // remaning bytes
+        bytePtr = reinterpret_cast<unsigned char*>(widePtr);
+        while (n-- > 0) {
+            *bytePtr++ = static_cast<unsigned char>(val);
+        }
+    }
+
+    void memmove(void* dest, const void* src, size_t n) {
+        char* d = reinterpret_cast<char*>(dest);
+        const char* s = reinterpret_cast<const char*>(src);
+
+        if (d < s) {
+            // blocks of 16 bytes
+            while (n >= 16) {
+                __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(d), data);
+                d += 16;
+                s += 16;
+                n -= 16;
+            }
+            // remaining bytes
+            while (n--) {
+                *d++ = *s++;
+            }
+        }
+        else {
+            d += n;
+            s += n;
+            // blocks of 16 bytes
+            while (n >= 16) {
+                d -= 16;
+                s -= 16;
+                n -= 16;
+                __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(d), data);
+            }
+            // remaining bytes
+            while (n--) {
+                *--d = *--s;
+            }
+        }
+    }
+
+    int memcmp(const void* s1, const void* s2, size_t n) {
+        auto p1 = static_cast<const unsigned char*>(s1);
+        auto p2 = static_cast<const unsigned char*>(s2);
+
+        while (n >= 32) {
+            __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p1));
+            __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p2));
+
+            // 32 bytes comparison
+            __m256i result = _mm256_cmpeq_epi8(v1, v2);
+            int mask = _mm256_movemask_epi8(result);
+
+            // not all bytes are equal
+            if (mask != -1) {
+                for (int i = 0; i < 32; ++i) {
+                    if (p1[i] != p2[i]) {
+                        return p1[i] - p2[i];
+                    }
+                }
+            }
+
+            p1 += 32;
+            p2 += 32;
+            n -= 32;
+        }
+
+        // remaining
+        while (n--) {
+            if (*p1 != *p2) {
+                return *p1 - *p2;
+            }
+            p1++;
+            p2++;
+        }
     }
 }
